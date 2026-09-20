@@ -9,15 +9,18 @@ import "Model.js" as Model
 // rotation, so it works on any mouse and is independent of firmware.
 // Live changes go through `hyprctl eval hl.device(...)`; the same value is
 // mirrored into a generated Lua file so it survives Hyprland restarts.
+// Settings are keyed by hardware id (bus:vendor:product[:serial]); device
+// names are only handles resolved for applying them.
 Panel {
   id: root
   moduleName: "io.github.kaz.omarchy-mouse-angle"
   ipcTarget: "io.github.kaz.omarchy-mouse-angle"
 
   property string angleFile: (Quickshell.env("HOME") || "") + "/.config/hypr/mouse-angle.lua"
-  property var angles: []        // persisted: [{ name, rotation }]
-  property var mice: []          // currently connected pointer devices
-  property string selected: ""
+  property var angles: []        // persisted: [{ hwid, name, rotation }]
+  property var mice: []          // connected pointers: [{ name, hwid }]
+  property string selected: ""   // identity key: hwid, or name when unknown
+  property var evalQueue: []
   property string lastError: ""
   property int fineStep: 1
   property int coarseStep: 5
@@ -27,19 +30,28 @@ Panel {
   readonly property var rows: rowList()
   readonly property var steps: [-coarseStep, -fineStep, fineStep, coarseStep]
 
-  function rotationOf(name) {
-    var e = Model.find(root.angles, name)
+  function rotationOf(key) {
+    var e = Model.find(root.angles, key)
     return e ? e.rotation : 0
   }
 
-  // Connected mice first, then remembered names (e.g. an unplugged mouse).
+  // Connected mice first (one row per hardware id), then remembered entries
+  // (e.g. an unplugged mouse).
   function rowList() {
-    var out = [], i
-    for (i = 0; i < root.mice.length; i++)
-      out.push({ name: root.mice[i], rotation: root.rotationOf(root.mice[i]) })
-    for (i = 0; i < root.angles.length; i++)
-      if (root.mice.indexOf(root.angles[i].name) === -1)
-        out.push({ name: root.angles[i].name, rotation: root.angles[i].rotation })
+    var out = [], seen = {}, i, key
+    for (i = 0; i < root.mice.length; i++) {
+      key = Model.keyOf(root.mice[i])
+      if (seen[key]) continue
+      seen[key] = true
+      out.push({ key: key, name: root.mice[i].name, rotation: root.rotationOf(key) })
+    }
+    for (i = 0; i < root.angles.length; i++) {
+      key = Model.keyOf(root.angles[i])
+      if (!seen[key]) {
+        seen[key] = true
+        out.push({ key: key, name: root.angles[i].name, rotation: root.angles[i].rotation })
+      }
+    }
     return out
   }
 
@@ -48,29 +60,91 @@ Panel {
   function defaultSelection() {
     var i
     for (i = 0; i < root.angles.length; i++)
-      if (root.angles[i].rotation !== 0) return root.angles[i].name
-    return root.mice.length > 0 ? root.mice[0] : ""
+      if (root.angles[i].rotation !== 0) return Model.keyOf(root.angles[i])
+    return root.mice.length > 0 ? Model.keyOf(root.mice[0]) : ""
   }
 
-  function setAngle(name, deg) {
-    if (!name) return
-    if (!Model.isSafeName(name)) {
-      root.lastError = "Unusable device name: " + name
+  function deviceByKey(key) {
+    for (var i = 0; i < root.mice.length; i++)
+      if (Model.keyOf(root.mice[i]) === key) return root.mice[i]
+    return null
+  }
+
+  function selectedName() {
+    var e = Model.find(root.angles, root.selected), d = deviceByKey(root.selected)
+    return (e && e.name) || (d && d.name) || ""
+  }
+
+  function setAngle(key, deg) {
+    if (!key) return
+    var entry = Model.find(root.angles, key)
+    var dev = deviceByKey(key)
+    if (!entry && !dev) return
+    // The name travels with the identity: refresh it to the connected
+    // device's current name so startup applies keep working after renames.
+    if (dev) {
+      if (!entry) entry = { hwid: dev.hwid, name: dev.name }
+      else { entry.hwid = dev.hwid; entry.name = dev.name }
+    }
+    if (!Model.isSafeName(entry.name)) {
+      root.lastError = "Unusable device name: " + entry.name
       return
     }
-    var next = Model.normalize(deg)
-    root.angles = Model.upsert(root.angles, name, next)
+    entry.rotation = Model.normalize(deg)
+    root.angles = Model.upsert(root.angles, entry)
     root.saveAngleFile()
-    root.applyAngle(name, next)
+    root.applyAngle(entry)
   }
 
   function nudge(delta) {
     if (root.selected) root.setAngle(root.selected, root.rotation + delta)
   }
 
-  function applyAngle(name, deg) {
-    evalProc.command = ["hyprctl", "eval", 'hl.device({ name = "' + name + '", rotation = ' + deg + ' })']
+  // Apply to every connected device carrying this hardware id (identical
+  // models resolve to the same id). Nothing connected: the generated file
+  // applies it at the next Hyprland start.
+  function applyAngle(entry) {
+    var key = Model.keyOf(entry), queue = [], i
+    for (i = 0; i < root.mice.length; i++)
+      if (Model.keyOf(root.mice[i]) === key)
+        queue.push('hl.device({ name = "' + root.mice[i].name + '", rotation = ' + entry.rotation + ' })')
+    if (queue.length === 0) return
+    root.evalQueue = queue
+    runNextEval()
+  }
+
+  function runNextEval() {
+    if (root.evalQueue.length === 0) return
+    evalProc.command = ["hyprctl", "eval", root.evalQueue[0]]
     evalProc.running = true
+  }
+
+  // Reconcile remembered entries with the connected devices: name-only
+  // entries adopt a hardware id (pre-hwid state files, plus stale Hyprland
+  // "-N" dedup names), hwid-keyed entries re-heal their stored name after
+  // renames, and duplicate identities collapse into the first entry.
+  function syncEntries() {
+    var out = [], dirty = false, i, j, e, d
+    for (i = 0; i < root.angles.length; i++) {
+      e = root.angles[i]
+      if (!e.hwid) {
+        for (j = 0; j < root.mice.length; j++)
+          if (root.mice[j].name === e.name && root.mice[j].hwid) { e.hwid = root.mice[j].hwid; dirty = true; break }
+        var m = String(e.name || "").match(/^(.*)-\d+$/)
+        if (!e.hwid && m)
+          for (j = 0; j < root.mice.length; j++)
+            if (root.mice[j].name === m[1] && root.mice[j].hwid) { e.hwid = root.mice[j].hwid; e.name = root.mice[j].name; dirty = true; break }
+      }
+      if (e.hwid) {
+        for (j = 0; j < root.mice.length; j++) {
+          d = root.mice[j]
+          if (d.hwid === e.hwid && d.name !== e.name) { e.name = d.name; dirty = true; break }
+        }
+      }
+      if (Model.find(out, Model.keyOf(e))) { dirty = true; continue }
+      out.push(e)
+    }
+    if (dirty) { root.angles = out; root.saveAngleFile() }
   }
 
   function saveAngleFile() {
@@ -116,12 +190,14 @@ Panel {
     id: listProc
     running: false
     // sysfs key masks ride along so keyboards with an embedded mouse node
-    // (e.g. the Wooting 60HE) can be told apart from standalone mice.
-    command: ["sh", "-c", 'hyprctl devices -j; echo ' + Model.NODES_MARKER + '; for d in /sys/class/input/event*/device; do printf "%s\\t%s\\n" "$(cat "$d/name" 2>/dev/null)" "$(cat "$d/capabilities/key" 2>/dev/null)"; done']
+    // (e.g. the Wooting 60HE) can be told apart from standalone mice; the
+    // id column gives the evdev hardware identity used as the settings key.
+    command: ["sh", "-c", 'hyprctl devices -j; echo ' + Model.NODES_MARKER + '; for d in /sys/class/input/event*/device; do printf "%s\\t%s\\t%s:%s:%s%s\\n" "$(cat "$d/name" 2>/dev/null)" "$(cat "$d/capabilities/key" 2>/dev/null)" "$(cat "$d/id/bustype" 2>/dev/null)" "$(cat "$d/id/vendor" 2>/dev/null)" "$(cat "$d/id/product" 2>/dev/null)" "$(u="$d/uniq"; [ -s "$u" ] && printf ":%s" "$(cat "$u")")"; done']
     stdout: StdioCollector { id: listOut; waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode !== 0) return
       root.mice = Model.parseDeviceDump(listOut.text)
+      root.syncEntries()
       if (root.selected === "") root.selected = root.defaultSelection()
     }
   }
@@ -141,7 +217,9 @@ Panel {
     stdout: StdioCollector { id: evalOut; waitForEnd: true }
     stderr: StdioCollector { id: evalErr; waitForEnd: true }
     onExited: function(exitCode) {
+      root.evalQueue = root.evalQueue.slice(1)
       root.noteError(String(evalOut.text || "") + String(evalErr.text || ""), exitCode)
+      root.runNextEval()
     }
   }
 
@@ -160,8 +238,8 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    tooltipText: root.selected !== ""
-      ? Model.prettyName(root.selected) + " \u2014 " + Model.describe(root.rotation)
+    tooltipText: root.selectedName() !== ""
+      ? Model.prettyName(root.selectedName()) + " \u2014 " + Model.describe(root.rotation)
       : "No mouse detected"
     iconComponent: Component {
       Item {
@@ -219,7 +297,7 @@ Panel {
             spacing: Style.space(2)
 
             Text {
-              text: root.selected !== "" ? Model.prettyName(root.selected) : "No mouse detected"
+              text: root.selectedName() !== "" ? Model.prettyName(root.selectedName()) : "No mouse detected"
               color: root.bar.foreground
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.title
@@ -284,8 +362,8 @@ Panel {
                 horizontalPadding: Style.spacing.controlPaddingX
                 verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
                 bordered: true
-                active: root.selected === modelData.name
-                onClicked: root.selected = modelData.name
+                active: root.selected === modelData.key
+                onClicked: root.selected = modelData.key
               }
 
               Text {

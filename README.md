@@ -29,8 +29,10 @@ require_optional.module("hypr.mouse-angle")
 
 Click the bar glyph: pick a mouse, then adjust with the buttons, slider, or
 arrow keys. Degrees are clockwise, 0–359 — 353 is 7 degrees anticlockwise.
-Settings apply immediately and persist to the generated
-`~/.config/hypr/mouse-angle.lua` (edit by hand, then `hyprctl reload`).
+Settings are keyed by the mouse's hardware id (`bus:vendor:product[:serial]`),
+so they survive renames and re-plugging, and apply immediately, persisting to
+the generated `~/.config/hypr/mouse-angle.lua` (edit by hand, then
+`hyprctl reload`).
 
 ## Development
 
