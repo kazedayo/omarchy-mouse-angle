@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.kaz.omarchy-mouse-angle",
+  "name": "Omarchy Mouse Angle",
+  "version": "1.0.0",
+  "author": "kaz",
+  "license": "MIT",
+  "description": "Per-mouse sensor angle (Hyprland device rotation), persisted to hypr/mouse-angle.lua",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Omarchy Mouse Angle",
+    "description": "Rotate pointer input per mouse, in degrees",
+    "category": "Input",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
