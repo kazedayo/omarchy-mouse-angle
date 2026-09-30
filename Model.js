@@ -49,9 +49,15 @@ function isSafeHwid(hw) {
 }
 
 // Identity key of a device or a stored entry. hwid beats name; names cannot
-// contain ":", so the two key spaces never collide.
+// contain ":", so the two key spaces never collide. Only bus:vendor:product
+// identifies: dongle serials roll on re-pair, which would ghost the old
+// entry forever - the serial's real job, telling apart two identical models
+// plugged in at once, is served by giving twins a single settings row
+// (applyAngle broadcasts it to every matching device).
 function keyOf(e) {
-  return (e && e.hwid) || (e && e.name) || ""
+  if (!e) return ""
+  if (e.hwid) return String(e.hwid).split(":").slice(0, 3).join(":")
+  return e.name || ""
 }
 
 function parseAngleFile(text) {
@@ -74,7 +80,9 @@ function formatAngleFile(entries) {
     "-- omarchy-mouse-angle bar widget; edit it there, or by hand followed",
     "-- by `hyprctl reload`. Degrees are clockwise: 353 == 7 anticlockwise.",
     "-- A mouse is identified by the trailing -- hwid bus:vendor:product[:serial];",
-    "-- the name is only Hyprland's handle for applying it at startup.",
+    "-- only bus:vendor:product is the identity (serials roll on re-pair; the",
+    "-- serial just tells identical models apart). The name is only Hyprland's",
+    "-- handle for applying it at startup.",
     ""
   ]
   for (var i = 0; i < (entries || []).length; i++) {
@@ -120,10 +128,8 @@ function describe(deg) {
   return Math.abs(n) + "\u00b0 " + (n > 0 ? "clockwise" : "anticlockwise")
 }
 
-function parseMice(json) {
+function parseMice(data) {
   var out = []
-  var data
-  try { data = JSON.parse(String(json || "")) } catch (e) { return out }
   var mice = (data && data.mice) || []
   for (var i = 0; i < mice.length; i++) {
     var name = mice[i] && mice[i].name
@@ -150,6 +156,20 @@ function isKeyboardNode(keyMask) {
 // mouse like "Finalmouse UltralightX dongle Mouse" has no such base node.
 function isKeyboardEmbedded(name, keyboards) {
   var m = String(name || "").match(/^(.*)-mouse(?:-\d+)?$/)
+  return !!(m && keyboards[m[1]])
+}
+
+// Keyboards whose pointer interface shares the keyboard node's own name
+// (e.g. Topre REALFORCE C1H) collide in Hyprland, which renames the second
+// device to "<name>-N" - so the pointer shows up as "topre-realforce-c1h-1",
+// with no "-mouse" tail for isKeyboardEmbedded. Ground truth is Hyprland's
+// own "keyboards" array: hide a mouse whose name is a keyboard's name with
+// Hyprland's dedup "-N" appended. Two identical keyboards are covered too:
+// every pointer interface still derives from a listed keyboard name.
+function isKeyboardMouse(name, keyboards) {
+  var n = normalizeName(name), m
+  if (!n) return false
+  m = n.match(/^(.*)-\d+$/)
   return !!(m && keyboards[m[1]])
 }
 
@@ -187,6 +207,11 @@ function parseDeviceDump(raw) {
   var micePart = at === -1 ? text : text.slice(0, at)
   var nodesPart = at === -1 ? "" : text.slice(at + NODES_MARKER.length)
 
+  var data = null
+  try { data = JSON.parse(micePart) } catch (e) {}
+
+  // One keyboard-name set from two sources: sysfs nodes carrying a real
+  // keyboard key mask, plus Hyprland's own "keyboards" classification.
   var keyboards = {}, nodes = []
   var lines = nodesPart.split("\n")
   for (var i = 0; i < lines.length; i++) {
@@ -196,10 +221,15 @@ function parseDeviceDump(raw) {
     if (parts.length >= 2 && isKeyboardNode(parts[1])) keyboards[nname] = true
     nodes.push({ name: nname, hwid: parts.length >= 3 ? normalizeHwid(parts[2]) : null })
   }
+  var kbList = (data && data.keyboards) || []
+  for (i = 0; i < kbList.length; i++) {
+    var kn = normalizeName(kbList[i] && kbList[i].name)
+    if (kn) keyboards[kn] = true
+  }
 
-  var mice = parseMice(micePart), out = []
+  var mice = parseMice(data), out = []
   for (var j = 0; j < mice.length; j++)
-    if (!isKeyboardEmbedded(mice[j], keyboards))
+    if (!isKeyboardEmbedded(mice[j], keyboards) && !isKeyboardMouse(mice[j], keyboards))
       out.push({ name: mice[j], hwid: matchHwid(mice[j], nodes) })
   return out
 }

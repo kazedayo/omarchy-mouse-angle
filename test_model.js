@@ -44,9 +44,13 @@ assert.strictEqual(ctx.describe(353), "7\u00b0 anticlockwise")
 assert.strictEqual(ctx.describe(7), "7\u00b0 clockwise")
 assert.strictEqual(ctx.label(0), "0\u00b0")
 
-// identity: hwid beats name, name is the fallback key
+// identity: hwid beats name, name is the fallback key; only bus:vendor:product
+// keys a device, the serial is informational
 assert.strictEqual(ctx.keyOf({ hwid: "0003:361d:0100", name: "a-mouse" }), "0003:361d:0100")
 assert.strictEqual(ctx.keyOf({ name: "a-mouse" }), "a-mouse")
+assert.strictEqual(ctx.keyOf({ hwid: "0003:361d:0100:ab12" }), "0003:361d:0100")
+assert.strictEqual(ctx.keyOf(null), "")
+assert.strictEqual(ctx.keyOf({}), "")
 
 // upsert replaces by identity, keeps other mice, no duplicates
 var list = ctx.upsert(ctx.upsert([], { name: "a-mouse", rotation: 5 }), { name: "a-mouse", rotation: 6 })
@@ -59,16 +63,25 @@ assert.strictEqual(withHwid.length, 2)
 assert.strictEqual(ctx.find(withHwid, "0003:1111:2222").rotation, 6)
 assert.deepStrictEqual(ctx.upsert(withHwid, { name: "b-mouse", rotation: 1 }).length, 3)
 
+// a re-paired dongle (new serial, same vendor:product) collapses onto the
+// old entry at parse time instead of ghosting a second row
+assert.deepStrictEqual(
+  JSON.parse(JSON.stringify(ctx.parseAngleFile(
+    'hl.device({ name = "f-mouse", rotation = 353 }) -- hwid 0003:361d:0100:6e6785b5d42579a6\n' +
+    'hl.device({ name = "f-mouse", rotation = 353 }) -- hwid 0003:361d:0100:909e9097bffe7382\n'))),
+  [{ name: "f-mouse", hwid: "0003:361d:0100:6e6785b5d42579a6", rotation: 353 }]
+)
+
 // device names are validated before landing in generated Lua
 assert.strictEqual(ctx.isSafeName('evil", rotation = 1 })\nhl.device({ name = "x'), false)
 
 // hyprctl junk nodes are filtered out
-var mice = ctx.parseMice(JSON.stringify({ mice: [
+var mice = ctx.parseMice({ mice: [
   { name: "finalmouse-ultralightx-dongle-mouse" },
   { name: "wooting-wooting-60he-(arm)-mouse" },
   { name: "wooting-wooting-60he-(arm)-consumer-control-1" },
   { name: "endgame-gear-endgame-gear-op1-8k-v2-gaming-mouse-keyboard-1" }
-] }))
+] })
 assert.strictEqual(JSON.stringify(mice), JSON.stringify(["finalmouse-ultralightx-dongle-mouse", "wooting-wooting-60he-(arm)-mouse"]))
 
 // keyboard-node detection from sysfs key masks (words print highest first)
@@ -77,23 +90,44 @@ assert.strictEqual(ctx.isKeyboardNode("1000000000007 ff980000000007ff febeffdfff
 assert.strictEqual(ctx.isKeyboardNode(""), false)
 assert.strictEqual(ctx.normalizeName("Wooting Wooting 60HE (ARM) Mouse"), "wooting-wooting-60he-(arm)-mouse")
 
+// dedup-name detection: a pointer interface named like the keyboard node
+// itself (Topre REALFORCE C1H) gets Hyprland's "-N" suffix; matching a
+// keyboards-array name after stripping it hides the keyboard's mouse
+assert.strictEqual(ctx.isKeyboardMouse("topre-realforce-c1h-1", { "topre-realforce-c1h": true }), true)
+assert.strictEqual(ctx.isKeyboardMouse("finalmouse-ultralightx-dongle-mouse", { "finalmouse-ultralightx-dongle": true }), false)
+assert.strictEqual(ctx.isKeyboardMouse("topre-realforce-c1h", { "topre-realforce-c1h": true }), false)
+assert.strictEqual(ctx.isKeyboardMouse("", { "x": true }), false)
+
 // the real dump: keyboards' embedded mouse nodes are hidden, standalone mice
 // keep their evdev hardware id; composite EGG matches its node by suffix
-var dump = JSON.stringify({ mice: [
+var dump = JSON.stringify({
+  mice: [
   { name: "endgame-gear-endgame-gear-op1-8k-v2-gaming-mouse" },
   { name: "endgame-gear-endgame-gear-op1-8k-v2-gaming-mouse-keyboard-1" },
   { name: "wooting-wooting-60he-(arm)-consumer-control-1" },
   { name: "wooting-wooting-60he-(arm)-mouse" },
   { name: "finalmouse-ultralightx-dongle-mouse" },
-  { name: "finalmouse-ultralightx-dongle-mouse-1" }
-] }) + "\n" + ctx.NODES_MARKER + "\n" +
+  { name: "finalmouse-ultralightx-dongle-mouse-1" },
+  { name: "topre-realforce-c1h-1" }
+  ],
+  keyboards: [
+    { name: "sony-inzone-buds-consumer-control" },
+    { name: "topre-realforce-c1h" },
+    { name: "topre-realforce-c1h-keyboard" },
+    { name: "power-button" },
+    { name: "hl-virtual-keyboard-fcitx5" }
+  ]
+}) + "\n" + ctx.NODES_MARKER + "\n" +
   "Wooting Wooting 60HE (ARM)\t1000000000007 ff980000000007ff febeffdfffefffff fffffffffffffffe\t0003:341d:0101\n" +
   "Wooting Wooting 60HE (ARM) System Control\tc000 10000000000000 0\t0003:341d:0101\n" +
   "Wooting Wooting 60HE (ARM) Consumer Control\t733fff 0 0 483ffff17aff32d\t0003:341d:0101\n" +
   "Wooting Wooting 60HE (ARM) Mouse\t1f0000 0 0 0 0\t0003:341d:0101\n" +
   "Endgame Gear Endgame Gear OP1 8k v2 Gaming Mouse\t1f0000 0 0 0 0\t0003:33fa:0901:4d4b\n" +
   "Endgame Gear Endgame Gear OP1 8k v2 Gaming Mouse Keyboard\t733eff 0 0 483ffff17aff32d e09effdf01cfffff fffffffffffffffe\t0003:33fa:0901:4d4b\n" +
-  "Finalmouse UltralightX dongle Mouse\t1f0000 0 0 0 0\t0003:361d:0100:6e6785b5d42579a6\n"
+  "Finalmouse UltralightX dongle Mouse\t1f0000 0 0 0 0\t0003:361d:0100:6e6785b5d42579a6\n" +
+  "Topre REALFORCE C1H\t1000000000007 ff9f207ac14057ff febeffdfffefffff fffffffffffffffe\t0003:0853:031b\n" +
+  "Topre REALFORCE C1H Keyboard\t1000302000007 ff98387ad80117ff febeffdfffefffff fffffffffffffffe\t0003:0853:031b\n" +
+  "Topre REALFORCE C1H\tff0000 0 0 0 0\t0003:0853:031b\n"
 assert.strictEqual(
   JSON.stringify(ctx.parseDeviceDump(dump)),
   JSON.stringify([
@@ -102,6 +136,9 @@ assert.strictEqual(
     { name: "finalmouse-ultralightx-dongle-mouse-1", hwid: "0003:361d:0100:6e6785b5d42579a6" }
   ])
 )
+// identical keyboards dedup too: pointers land as "<name>-2"/"<name>-3",
+// both stripped back to the (still listed) keyboard name
+assert.strictEqual(ctx.isKeyboardMouse("topre-realforce-c1h-2", { "topre-realforce-c1h": true }), true)
 // a marker-less dump (sysfs unreadable) falls back to name filtering only
 assert.strictEqual(
   JSON.stringify(ctx.parseDeviceDump('{"mice":[{"name":"wooting-wooting-60he-(arm)-mouse"}]}')),

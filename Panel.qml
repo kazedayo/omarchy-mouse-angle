@@ -138,7 +138,7 @@ Panel {
       if (e.hwid) {
         for (j = 0; j < root.mice.length; j++) {
           d = root.mice[j]
-          if (d.hwid === e.hwid && d.name !== e.name) { e.name = d.name; dirty = true; break }
+          if (Model.keyOf(d) === Model.keyOf(e) && d.name !== e.name) { e.name = d.name; dirty = true; break }
         }
       }
       if (Model.find(out, Model.keyOf(e))) { dirty = true; continue }
