@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
 import "Model.js" as Model
@@ -11,10 +12,18 @@ import "Model.js" as Model
 // mirrored into a generated Lua file so it survives Hyprland restarts.
 // Settings are keyed by hardware id (bus:vendor:product[:serial]); device
 // names are only handles resolved for applying them.
-Panel {
+//
+// Standalone panel plugin (no bar icon): summoned from the omarchy menu, the
+// content appears as a centered card on a scrim; Esc, Tab and the arrow keys
+// drive it like the old bar popup did.
+Item {
   id: root
-  moduleName: "io.github.kaz.omarchy-mouse-angle"
-  ipcTarget: "io.github.kaz.omarchy-mouse-angle"
+
+  property string omarchyPath: Quickshell.env("OMARCHY_PATH")
+  property var shell: null
+  property var manifest: null
+
+  property bool opened: false
 
   property string angleFile: (Quickshell.env("HOME") || "") + "/.config/hypr/mouse-angle.lua"
   property var angles: []        // persisted: [{ hwid, name, rotation }]
@@ -25,7 +34,9 @@ Panel {
   property int fineStep: 1
   property int coarseStep: 5
 
-  readonly property color dim: Qt.darker(barForeground, 1.4)
+  readonly property string fontFamily: Style.font.family
+  readonly property color fg: Color.popups.text
+  readonly property color dim: Util.alpha(Color.popups.text, 0.55)
   readonly property int rotation: rotationOf(selected)
   readonly property var rows: rowList()
   readonly property var steps: [-coarseStep, -fineStep, fineStep, coarseStep]
@@ -55,8 +66,8 @@ Panel {
     return out
   }
 
-  // Prefer a device that is actually rotated, so the bar shows the mouse you
-  // tuned rather than whichever one Hyprland happened to list first.
+  // Prefer a device that is actually rotated, so the panel opens on the mouse
+  // you tuned rather than whichever one Hyprland happened to list first.
   function defaultSelection() {
     var i
     for (i = 0; i < root.angles.length; i++)
@@ -163,8 +174,37 @@ Panel {
     else root.lastError = ""
   }
 
-  implicitWidth: button.implicitWidth
-  implicitHeight: button.implicitHeight
+  function open(payloadJson) {
+    root.opened = true
+    refreshDevices()
+    angleView.reload()
+    // The window is instantiated hidden, so focus set declaratively would be
+    // evaluated before the surface is mapped and Escape would land nowhere.
+    // Re-acquire after mapping.
+    Qt.callLater(function() {
+      if (root.opened) keyCatcher.forceActiveFocus()
+    })
+  }
+
+  function close() {
+    root.opened = false
+  }
+
+  function dismiss() {
+    if (root.shell && typeof root.shell.hide === "function")
+      root.shell.hide((root.manifest && root.manifest.id) || "io.github.kaz.omarchy-mouse-angle")
+    else close()
+  }
+
+  // Tab cycles the mouse rows (the bar popup used this to jump bar panels).
+  function switchRow(direction) {
+    var list = root.rows
+    if (list.length === 0) return
+    var i = 0
+    for (var j = 0; j < list.length; j++)
+      if (list[j].key === root.selected) { i = j; break }
+    root.selected = list[(i + direction + list.length) % list.length].key
+  }
 
   Component.onCompleted: {
     refreshDevices()
@@ -234,236 +274,267 @@ Panel {
     }
   }
 
-  BarIconButton {
-    id: button
-    anchors.fill: parent
-    bar: root.bar
-    tooltipText: root.selectedName() !== ""
-      ? Model.prettyName(root.selectedName()) + " \u2014 " + Model.describe(root.rotation)
-      : "No mouse detected"
-    iconComponent: Component {
-      Item {
-        // Tilted by the signed angle (QML rotation is clockwise, like
-        // libinput's degrees) — the exact value lives in the tooltip/panel.
-        MouseIcon {
-          anchors.centerIn: parent
-          iconSize: parent.width
-          color: root.selected !== "" ? root.barForeground : root.dim
-          innerColor: root.bar ? root.bar.background : Color.background
-          rotation: Model.signed(root.rotation)
-        }
-      }
-    }
-    onPressed: root.toggle()
+
+  IpcHandler {
+    target: "io.github.kaz.omarchy-mouse-angle"
+    function open(): string { root.open(""); return "ok" }
+    function close(): string { root.close(); return "ok" }
+    function toggle(): string { root.opened ? root.dismiss() : root.open(""); return "ok" }
+    function query(): string { return root.opened ? "open" : "closed" }
+    function ping(): string { return "ok" }
   }
 
-  KeyboardPanel {
+  PanelWindow {
     id: panel
-    anchorItem: button
-    owner: root
-    bar: root.bar
-    open: root.opened
-    focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(380))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight)
+    visible: root.opened
+    anchors { top: true; bottom: true; left: true; right: true }
+    color: "transparent"
+    WlrLayershell.namespace: "kaz-mouse-angle"
+    WlrLayershell.layer: WlrLayer.Overlay
+    WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
+    exclusionMode: ExclusionMode.Ignore
 
-    PanelKeyCatcher {
-      id: keyCatcher
+    readonly property int pad: Style.space(16)
+    readonly property int contentWidth: Style.space(380)
+
+    Rectangle {
       anchors.fill: parent
-      onMoveRequested: function(dx, dy) {
-        if (dx !== 0) root.nudge(dx)
-        else if (dy !== 0) root.nudge(-dy * root.coarseStep)
+      // Fixed near-black regardless of theme, like the other scrim panels,
+      // so the card keeps its contrast on any wallpaper.
+      color: Qt.rgba(0, 0, 0, 0.78)
+
+      MouseArea {
+        anchors.fill: parent
+        onClicked: root.dismiss()
       }
-      onCloseRequested: root.close()
-      onTabRequested: function(direction) { root.switchPanel(direction) }
 
-      Column {
-        id: column
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: parent.top
-        spacing: Style.space(14)
+      BorderSurface {
+        id: card
+        width: card.borderLeft + panel.pad + panel.contentWidth + panel.pad + card.borderRight
+        height: card.borderTop + panel.pad + column.implicitHeight + panel.pad + card.borderBottom
+        anchors.centerIn: parent
+        color: Util.alpha(Color.popups.background, 0.97)
+        borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
+        radius: Style.cornerRadius
 
-        Item {
-          width: parent.width
-          implicitHeight: Math.max(heroLabels.implicitHeight, heroAngle.implicitHeight)
+        PanelKeyCatcher {
+          id: keyCatcher
+          anchors.fill: parent
+          onMoveRequested: function(dx, dy) {
+            if (dx !== 0) root.nudge(dx)
+            else if (dy !== 0) root.nudge(-dy * root.coarseStep)
+          }
+          onCloseRequested: root.dismiss()
+          onTabRequested: function(direction) { root.switchRow(direction) }
 
           Column {
-            id: heroLabels
+            id: column
             anchors.left: parent.left
-            anchors.right: heroAngle.left
-            anchors.rightMargin: Style.space(10)
-            anchors.verticalCenter: parent.verticalCenter
-            spacing: Style.space(2)
-
-            Text {
-              text: root.selectedName() !== "" ? Model.prettyName(root.selectedName()) : "No mouse detected"
-              color: root.bar.foreground
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.title
-              font.bold: true
-              elide: Text.ElideRight
-              width: parent.width
-            }
-
-            Text {
-              textFormat: Text.PlainText
-              text: Model.describe(root.rotation).toUpperCase()
-              color: root.dim
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.caption
-              font.bold: true
-              font.letterSpacing: 1.2
-              elide: Text.ElideRight
-              width: parent.width
-            }
-          }
-
-          Text {
-            id: heroAngle
-            textFormat: Text.PlainText
-            text: Model.label(root.rotation)
-            color: root.bar.foreground
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.displayLarge
-            font.bold: true
             anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-          }
-        }
-
-        PanelSeparator { foreground: root.bar.foreground }
-
-        Column {
-          width: parent.width
-          spacing: Style.space(6)
-
-          PanelSectionHeader {
-            text: "MOUSE"
-            foreground: root.bar.foreground
-            fontFamily: root.bar.fontFamily
-          }
-
-          Repeater {
-            model: root.rows
+            anchors.top: parent.top
+            anchors.leftMargin: card.borderLeft + panel.pad
+            anchors.rightMargin: card.borderRight + panel.pad
+            anchors.topMargin: card.borderTop + panel.pad
+            spacing: Style.space(14)
 
             Item {
-              required property var modelData
-              width: column.width
-              implicitHeight: rowButton.implicitHeight
+              width: parent.width
+              implicitHeight: Math.max(heroLabels.implicitHeight, heroIcon.height, heroAngle.implicitHeight)
 
-              Button {
-                id: rowButton
+              MouseIcon {
+                id: heroIcon
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                iconSize: Style.font.title * 1.6
+                color: root.fg
+                innerColor: Color.popups.background
+                rotation: Model.signed(root.rotation)
+              }
+
+              Column {
+                id: heroLabels
+                anchors.left: heroIcon.right
+                anchors.leftMargin: Style.space(12)
+                anchors.right: heroAngle.left
+                anchors.rightMargin: Style.space(10)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: root.selectedName() !== "" ? Model.prettyName(root.selectedName()) : "No mouse detected"
+                  color: root.fg
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.title
+                  font.bold: true
+                  elide: Text.ElideRight
+                  width: parent.width
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: Model.describe(root.rotation).toUpperCase()
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  font.letterSpacing: 1.2
+                  elide: Text.ElideRight
+                  width: parent.width
+                }
+              }
+
+              Text {
+                id: heroAngle
+                textFormat: Text.PlainText
+                text: Model.label(root.rotation)
+                color: root.fg
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.displayLarge
+                font.bold: true
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+            PanelSeparator { foreground: root.fg }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(6)
+
+              PanelSectionHeader {
+                text: "MOUSE"
+                foreground: root.fg
+                fontFamily: root.fontFamily
+              }
+
+              Repeater {
+                model: root.rows
+
+                Item {
+                  required property var modelData
+                  width: column.width
+                  implicitHeight: rowButton.implicitHeight
+
+                  Button {
+                    id: rowButton
+                    width: parent.width
+                    text: Model.prettyName(modelData.name)
+                    fontSize: Style.font.bodySmall
+                    foreground: root.fg
+                    fontFamily: root.fontFamily
+                    horizontalPadding: Style.spacing.controlPaddingX
+                    verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
+                    bordered: true
+                    active: root.selected === modelData.key
+                    onClicked: root.selected = modelData.key
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: Model.label(modelData.rotation)
+                    color: root.selected === modelData.key ? root.fg : root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.space(12)
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
+              }
+            }
+
+            PanelSeparator { foreground: root.fg }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(6)
+              opacity: root.selected !== "" ? 1 : 0.45
+
+              PanelSectionHeader {
+                text: "ANGLE"
+                foreground: root.fg
+                fontFamily: root.fontFamily
+              }
+
+              Row {
+                id: stepRow
                 width: parent.width
-                text: Model.prettyName(modelData.name)
-                fontSize: Style.font.bodySmall
-                foreground: root.bar.foreground
-                fontFamily: root.bar.fontFamily
-                horizontalPadding: Style.spacing.controlPaddingX
-                verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
-                bordered: true
-                active: root.selected === modelData.key
-                onClicked: root.selected = modelData.key
+                spacing: Style.space(6)
+                readonly property real cellWidth: (width - spacing * (root.steps.length + 1)) / (root.steps.length + 1)
+
+                Repeater {
+                  model: root.steps
+
+                  Button {
+                    required property var modelData
+                    width: stepRow.cellWidth
+                    text: (modelData > 0 ? "+" : "") + modelData + "\u00b0"
+                    fontSize: Style.font.bodySmall
+                    foreground: root.fg
+                    fontFamily: root.fontFamily
+                    horizontalPadding: Style.spacing.controlPaddingX
+                    verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
+                    bordered: true
+                    enabled: root.selected !== ""
+                    onClicked: root.nudge(modelData)
+                  }
+                }
+
+                Button {
+                  width: stepRow.cellWidth
+                  text: "0\u00b0"
+                  fontSize: Style.font.bodySmall
+                  foreground: root.fg
+                  fontFamily: root.fontFamily
+                  horizontalPadding: Style.spacing.controlPaddingX
+                  verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
+                  bordered: true
+                  enabled: root.selected !== "" && root.rotation !== 0
+                  onClicked: root.setAngle(root.selected, 0)
+                }
+              }
+
+              CursorSurface {
+                width: parent.width
+                height: angleSlider.implicitHeight + Style.spacing.controlGap
+                foreground: root.fg
+                outline: true
+
+                PanelSlider {
+                  id: angleSlider
+                  bar: null
+                  trackColor: Util.alpha(root.fg, 0.25)
+                  fillColor: root.fg
+                  knobColor: root.fg
+                  tickColor: Color.popups.background
+                  anchors.fill: parent
+                  anchors.leftMargin: Style.space(6)
+                  anchors.rightMargin: Style.space(6)
+                  minimum: 0
+                  maximum: 359
+                  step: 1
+                  integer: true
+                  value: root.rotation
+                  enabled: root.selected !== ""
+                  onReleased: function(v) { root.setAngle(root.selected, v) }
+                }
               }
 
               Text {
                 textFormat: Text.PlainText
-                text: Model.label(modelData.rotation)
-                color: root.selected === modelData.name ? root.bar.foreground : root.dim
-                font.family: root.bar.fontFamily
+                text: root.lastError !== ""
+                  ? root.lastError
+                  : "clockwise degrees \u2014 353 = 7\u00b0 anticlockwise"
+                color: root.lastError !== "" ? root.fg : root.dim
+                font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
-                font.bold: true
-                anchors.right: parent.right
-                anchors.rightMargin: Style.space(12)
-                anchors.verticalCenter: parent.verticalCenter
+                elide: Text.ElideRight
+                width: parent.width
               }
             }
-          }
-        }
-
-        PanelSeparator { foreground: root.bar.foreground }
-
-        Column {
-          width: parent.width
-          spacing: Style.space(6)
-          opacity: root.selected !== "" ? 1 : 0.45
-
-          PanelSectionHeader {
-            text: "ANGLE"
-            foreground: root.bar.foreground
-            fontFamily: root.bar.fontFamily
-          }
-
-          Row {
-            id: stepRow
-            width: parent.width
-            spacing: Style.space(6)
-            readonly property real cellWidth: (width - spacing * (root.steps.length + 1)) / (root.steps.length + 1)
-
-            Repeater {
-              model: root.steps
-
-              Button {
-                required property var modelData
-                width: stepRow.cellWidth
-                text: (modelData > 0 ? "+" : "") + modelData + "\u00b0"
-                fontSize: Style.font.bodySmall
-                foreground: root.bar.foreground
-                fontFamily: root.bar.fontFamily
-                horizontalPadding: Style.spacing.controlPaddingX
-                verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
-                bordered: true
-                enabled: root.selected !== ""
-                onClicked: root.nudge(modelData)
-              }
-            }
-
-            Button {
-              width: stepRow.cellWidth
-              text: "0\u00b0"
-              fontSize: Style.font.bodySmall
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
-              horizontalPadding: Style.spacing.controlPaddingX
-              verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
-              bordered: true
-              enabled: root.selected !== "" && root.rotation !== 0
-              onClicked: root.setAngle(root.selected, 0)
-            }
-          }
-
-          CursorSurface {
-            width: parent.width
-            height: angleSlider.implicitHeight + Style.spacing.controlGap
-            foreground: root.bar.foreground
-            outline: true
-
-            PanelSlider {
-              id: angleSlider
-              bar: root.bar
-              anchors.fill: parent
-              anchors.leftMargin: Style.space(6)
-              anchors.rightMargin: Style.space(6)
-              minimum: 0
-              maximum: 359
-              step: 1
-              integer: true
-              value: root.rotation
-              enabled: root.selected !== ""
-              onReleased: function(v) { root.setAngle(root.selected, v) }
-            }
-          }
-
-          Text {
-            textFormat: Text.PlainText
-            text: root.lastError !== ""
-              ? root.lastError
-              : "clockwise degrees \u2014 353 = 7\u00b0 anticlockwise"
-            color: root.lastError !== "" ? root.bar.foreground : root.dim
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
-            width: parent.width
           }
         }
       }
